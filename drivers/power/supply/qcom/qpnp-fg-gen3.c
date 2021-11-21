@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -1034,6 +1034,14 @@ static int fg_get_batt_profile(struct fg_chip *chip)
 		pr_err("No profile data available\n");
 		return -ENODATA;
 	}
+
+	//begin for the total capacity of batt in  2017.11.29
+	rc = of_property_read_u32(profile_node, "qcom,nom-batt-capacity-mah", &chip->battery_full_design);
+	if (rc < 0) {
+		pr_err("No profile data available\n");
+		return -ENODATA;
+	}
+	//end for the total capacity of batt in  2017.11.29
 
 	if (len != PROFILE_LEN) {
 		pr_err("battery profile incorrect size: %d\n", len);
@@ -2608,7 +2616,7 @@ static void clear_cycle_counter(struct fg_chip *chip)
 	}
 	rc = fg_sram_write(chip, CYCLE_COUNT_WORD, CYCLE_COUNT_OFFSET,
 			(u8 *)&chip->cyc_ctr.count,
-			sizeof(chip->cyc_ctr.count) / (sizeof(u8 *)),
+			sizeof(chip->cyc_ctr.count) / sizeof(u8 *),
 			FG_IMA_DEFAULT);
 	if (rc < 0)
 		pr_err("failed to clear cycle counter rc=%d\n", rc);
@@ -3850,9 +3858,6 @@ static int fg_psy_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CC_STEP_SEL:
 		pval->intval = chip->ttf.cc_step.sel;
 		break;
-	case POWER_SUPPLY_PROP_FG_RESET_CLOCK:
-		pval->intval = 0;
-		break;
 	default:
 		pr_err("unsupported property %d\n", psp);
 		rc = -EINVAL;
@@ -3863,100 +3868,6 @@ static int fg_psy_get_property(struct power_supply *psy,
 		return -ENODATA;
 
 	return 0;
-}
-
-#define BCL_RESET_RETRY_COUNT 4
-static int fg_bcl_reset(struct fg_chip *chip)
-{
-	int i, ret, rc = 0;
-	u8 val, peek_mux;
-	bool success = false;
-
-	/* Read initial value of peek mux1 */
-	rc = fg_read(chip, BATT_INFO_PEEK_MUX1(chip), &peek_mux, 1);
-	if (rc < 0) {
-		pr_err("Error in writing peek mux1, rc=%d\n", rc);
-		return rc;
-	}
-
-	val = 0x83;
-	rc = fg_write(chip, BATT_INFO_PEEK_MUX1(chip), &val, 1);
-	if (rc < 0) {
-		pr_err("Error in writing peek mux1, rc=%d\n", rc);
-		return rc;
-	}
-
-	mutex_lock(&chip->sram_rw_lock);
-	for (i = 0; i < BCL_RESET_RETRY_COUNT; i++) {
-		rc = fg_dma_mem_req(chip, true);
-		if (rc < 0) {
-			pr_err("Error in locking memory, rc=%d\n", rc);
-			goto unlock;
-		}
-
-		rc = fg_read(chip, BATT_INFO_RDBACK(chip), &val, 1);
-		if (rc < 0) {
-			pr_err("Error in reading rdback, rc=%d\n", rc);
-			goto release_mem;
-		}
-
-		if (val & PEEK_MUX1_BIT) {
-			rc = fg_masked_write(chip, BATT_SOC_RST_CTRL0(chip),
-						BCL_RESET_BIT, BCL_RESET_BIT);
-			if (rc < 0) {
-				pr_err("Error in writing RST_CTRL0, rc=%d\n",
-						rc);
-				goto release_mem;
-			}
-
-			rc = fg_dma_mem_req(chip, false);
-			if (rc < 0)
-				pr_err("Error in unlocking memory, rc=%d\n",
-						rc);
-
-			/* Delay of 2ms */
-			usleep_range(2000, 3000);
-			ret = fg_masked_write(chip, BATT_SOC_RST_CTRL0(chip),
-						BCL_RESET_BIT, 0);
-			if (ret < 0)
-				pr_err("Error in writing RST_CTRL0, rc=%d\n",
-						rc);
-			if (!rc && !ret)
-				success = true;
-
-			goto unlock;
-		} else {
-			rc = fg_dma_mem_req(chip, false);
-			if (rc < 0) {
-				pr_err("Error in unlocking memory, rc=%d\n",
-						rc);
-				goto unlock;
-			}
-			success = false;
-			pr_err_ratelimited("PEEK_MUX1 not set retrying...\n");
-			msleep(1000);
-		}
-	}
-
-release_mem:
-	rc = fg_dma_mem_req(chip, false);
-	if (rc < 0)
-		pr_err("Error in unlocking memory, rc=%d\n", rc);
-
-unlock:
-	ret = fg_write(chip, BATT_INFO_PEEK_MUX1(chip), &peek_mux, 1);
-	if (ret < 0) {
-		pr_err("Error in writing peek mux1, rc=%d\n", rc);
-		mutex_unlock(&chip->sram_rw_lock);
-		return ret;
-	}
-
-	mutex_unlock(&chip->sram_rw_lock);
-
-	if (!success)
-		return -EAGAIN;
-	else
-		return rc;
 }
 
 static int fg_psy_set_property(struct power_supply *psy,
@@ -4044,13 +3955,6 @@ static int fg_psy_set_property(struct power_supply *psy,
 		rc = fg_set_jeita_threshold(chip, JEITA_HOT, pval->intval);
 		if (rc < 0) {
 			pr_err("Error in writing jeita_hot, rc=%d\n", rc);
-			return rc;
-		}
-		break;
-	case POWER_SUPPLY_PROP_FG_RESET_CLOCK:
-		rc = fg_bcl_reset(chip);
-		if (rc < 0) {
-			pr_err("Error in resetting BCL clock, rc=%d\n", rc);
 			return rc;
 		}
 		break;
@@ -4151,7 +4055,6 @@ static enum power_supply_property fg_psy_props[] = {
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
 	POWER_SUPPLY_PROP_CC_STEP,
 	POWER_SUPPLY_PROP_CC_STEP_SEL,
-	POWER_SUPPLY_PROP_FG_RESET_CLOCK,
 };
 
 static const struct power_supply_desc fg_psy_desc = {
@@ -4938,7 +4841,7 @@ static int fg_parse_ki_coefficients(struct fg_chip *chip)
 #define DEFAULT_CHG_TERM_CURR_MA	100
 #define DEFAULT_CHG_TERM_BASE_CURR_MA	75
 #define DEFAULT_SYS_TERM_CURR_MA	-125
-#define DEFAULT_CUTOFF_CURR_MA		500
+#define DEFAULT_CUTOFF_CURR_MA		200
 #define DEFAULT_DELTA_SOC_THR		1
 #define DEFAULT_RECHARGE_SOC_THR	95
 #define DEFAULT_BATT_TEMP_COLD		0
@@ -5095,7 +4998,7 @@ static int fg_parse_dt(struct fg_chip *chip)
 	if (rc < 0)
 		chip->dt.sys_term_curr_ma = DEFAULT_SYS_TERM_CURR_MA;
 	else
-		chip->dt.sys_term_curr_ma = temp;
+		chip->dt.sys_term_curr_ma = -temp;
 
 	rc = of_property_read_u32(node, "qcom,fg-chg-term-base-current", &temp);
 	if (rc < 0)
