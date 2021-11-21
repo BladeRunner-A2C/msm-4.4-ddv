@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2020, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -33,6 +33,7 @@
 #include "msm-cdc-common.h"
 #include "../../msm/sdm660-common.h"
 #include "../wcd-mbhc-v2.h"
+#include <linux/of_gpio.h>	//added by wenhuilong @20190313 for M690 audio bringup
 
 #define DRV_NAME "pmic_analog_codec"
 #define SDM660_CDC_RATES (SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |\
@@ -59,7 +60,7 @@
 #define SPK_PMD 2
 #define SPK_PMU 3
 
-#define MICBIAS_DEFAULT_VAL 1800000
+#define MICBIAS_DEFAULT_VAL 2700000	//modified from 1800000 to 2700000 by wenhuilong @20190531 for high impendance headphone mic
 #define MICBIAS_MIN_VAL 1600000
 #define MICBIAS_STEP_SIZE 50000
 
@@ -1631,11 +1632,11 @@ static int msm_anlg_cdc_pa_gain_get(struct snd_kcontrol *kcontrol,
 		if (ear_pa_gain == 0x00) {
 			ucontrol->value.integer.value[0] = 3;
 		} else if (ear_pa_gain == 0x01) {
-			ucontrol->value.integer.value[0] = 2;
+			ucontrol->value.integer.value[1] = 2;
 		} else if (ear_pa_gain == 0x02) {
-			ucontrol->value.integer.value[0] = 1;
+			ucontrol->value.integer.value[2] = 1;
 		} else if (ear_pa_gain == 0x03) {
-			ucontrol->value.integer.value[0] = 0;
+			ucontrol->value.integer.value[3] = 0;
 		} else {
 			dev_err(codec->dev,
 				"%s: ERROR: Unsupported Ear Gain = 0x%x\n",
@@ -1657,6 +1658,7 @@ static int msm_anlg_cdc_pa_gain_get(struct snd_kcontrol *kcontrol,
 			return -EINVAL;
 		}
 	}
+	ucontrol->value.integer.value[0] = ear_pa_gain;
 	dev_dbg(codec->dev, "%s: ear_pa_gain = 0x%x\n", __func__, ear_pa_gain);
 	return 0;
 }
@@ -1907,7 +1909,6 @@ static int msm_anlg_cdc_ext_spk_boost_set(struct snd_kcontrol *kcontrol,
 		__func__, sdm660_cdc->spk_boost_set);
 	return 0;
 }
-
 
 static const char * const msm_anlg_cdc_loopback_mode_ctrl_text[] = {
 		"DISABLE", "ENABLE"};
@@ -2330,8 +2331,10 @@ static int msm_anlg_cdc_codec_enable_spk_pa(struct snd_soc_dapm_widget *w,
 		msm_anlg_cdc_dig_notifier_call(codec,
 					       DIG_CDC_EVENT_RX3_MUTE_OFF);
 		snd_soc_update_bits(codec, w->reg, 0x80, 0x80);
+
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
+
 		msm_anlg_cdc_dig_notifier_call(codec,
 					       DIG_CDC_EVENT_RX3_MUTE_ON);
 		/*
@@ -3420,8 +3423,8 @@ static const struct snd_soc_dapm_widget msm_anlg_cdc_dapm_widgets[] = {
 		msm_anlg_cdc_hph_pa_event, SND_SOC_DAPM_PRE_PMU |
 		SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD |
 		SND_SOC_DAPM_POST_PMD),
-	SND_SOC_DAPM_PGA_E("SPK PA", MSM89XX_PMIC_ANALOG_SPKR_DRV_CTL,
-			7, 0, NULL, 0, msm_anlg_cdc_codec_enable_spk_pa,
+	SND_SOC_DAPM_PGA_E("SPK PA", SND_SOC_NOPM,
+			0, 0, NULL, 0, msm_anlg_cdc_codec_enable_spk_pa,
 			SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
 			SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD),
 	SND_SOC_DAPM_PGA_E("LINEOUT PA", MSM89XX_PMIC_ANALOG_RX_LO_EN_CTL,
@@ -4574,8 +4577,7 @@ static int msm_anlg_cdc_probe(struct platform_device *pdev)
 	int adsp_state;
 
 	adsp_state = apr_get_subsys_state();
-	if (adsp_state != APR_SUBSYS_LOADED ||
-		!q6core_is_adsp_ready()) {
+	if (adsp_state != APR_SUBSYS_LOADED) {
 		dev_err(&pdev->dev, "Adsp is not loaded yet %d\n",
 			adsp_state);
 		return -EPROBE_DEFER;
