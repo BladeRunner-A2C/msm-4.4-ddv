@@ -2,7 +2,6 @@
 #include <linux/sched.h>
 #include <linux/sched/sysctl.h>
 #include <linux/sched/rt.h>
-#include <linux/sched/smt.h>
 #include <linux/sched/deadline.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
@@ -235,8 +234,6 @@ struct cfs_bandwidth {
 	/* statistics */
 	int nr_periods, nr_throttled;
 	u64 throttled_time;
-
-	bool distribute_running;
 #endif
 };
 
@@ -1151,9 +1148,10 @@ extern unsigned int  __read_mostly sched_small_wakee_task_load;
 extern unsigned int  __read_mostly sched_spill_load;
 extern unsigned int  __read_mostly sched_upmigrate;
 extern unsigned int  __read_mostly sched_downmigrate;
+extern unsigned int  __read_mostly sysctl_sched_spill_nr_run;
 extern unsigned int  __read_mostly sched_load_granule;
 
-extern void init_new_task_load(struct task_struct *p);
+extern void init_new_task_load(struct task_struct *p, bool idle_task);
 extern u64 sched_ktime_clock(void);
 extern int got_boost_kick(void);
 extern int register_cpu_cycle_counter_cb(struct cpu_cycle_counter_cb *cb);
@@ -1643,7 +1641,7 @@ static inline struct sched_cluster *rq_cluster(struct rq *rq)
 	return NULL;
 }
 
-static inline void init_new_task_load(struct task_struct *p)
+static inline void init_new_task_load(struct task_struct *p, bool idle_task)
 {
 }
 
