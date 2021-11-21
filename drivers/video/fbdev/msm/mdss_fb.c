@@ -1,7 +1,7 @@
 /*
  * Core MDSS framebuffer driver.
  *
- * Copyright (c) 2008-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2008-2018, The Linux Foundation. All rights reserved.
  * Copyright (C) 2007 Google Incorporated
  *
  * This software is licensed under the terms of the GNU General Public
@@ -48,6 +48,8 @@
 #include <linux/dma-buf.h>
 #include <sync.h>
 #include <sw_sync.h>
+#include <linux/wakelock.h>
+#include <linux/mdss_io_util.h>
 
 #include "mdss_fb.h"
 #include "mdss_mdp_splash_logo.h"
@@ -82,8 +84,17 @@
  */
 #define MDP_TIME_PERIOD_CALC_FPS_US	1000000
 
+#define WAIT_RESUME_TIMEOUT 200
+
 static struct fb_info *fbi_list[MAX_FBI_LIST];
 static int fbi_list_index;
+
+/*add for fingerprint unlock by qujiong 20190625*/
+static struct fb_info *prim_fbi;
+static struct delayed_work prim_panel_work;
+static atomic_t prim_panel_is_on;
+static struct wake_lock prim_panel_wakelock;
+/*add for fingerprint unlock by qujiong 20190625*/
 
 static u32 mdss_fb_pseudo_palette[16] = {
 	0x00000000, 0xffffffff, 0xffffffff, 0xffffffff,
@@ -122,6 +133,96 @@ static int mdss_fb_send_panel_event(struct msm_fb_data_type *mfd,
 					int event, void *arg);
 static void mdss_fb_set_mdp_sync_pt_threshold(struct msm_fb_data_type *mfd,
 		int type);
+
+/*add for fingerprint unlock by qujiong 20190625 end*/
+static void prim_panel_off_delayed_work(struct work_struct *work)
+{
+#ifdef CONFIG_FRAMEBUFFER_CONSOLE
+	console_lock();
+#endif
+	if (!lock_fb_info(prim_fbi))
+	{
+	#ifdef CONFIG_FRAMEBUFFER_CONSOLE
+		console_unlock();
+	#endif
+		return;
+	}
+
+	if (atomic_read(&prim_panel_is_on)) {
+		fb_blank(prim_fbi, FB_BLANK_POWERDOWN);
+		atomic_set(&prim_panel_is_on, false);
+		wake_unlock(&prim_panel_wakelock);
+	}
+
+	unlock_fb_info(prim_fbi);
+#ifdef CONFIG_FRAMEBUFFER_CONSOLE
+	console_unlock();
+#endif
+}
+
+int mdss_prim_panel_fb_unblank(int timeout)
+{
+	int ret = 0;
+	struct msm_fb_data_type *mfd = NULL;
+
+	pr_info("cdfinger mdss_prim_panel_fb_unblank\n");
+
+	if (prim_fbi) {
+		mfd = (struct msm_fb_data_type *)prim_fbi->par;
+		ret = wait_event_timeout(mfd->resume_wait_q,
+			!atomic_read(&mfd->resume_pending),
+			msecs_to_jiffies(WAIT_RESUME_TIMEOUT));
+
+		if (!ret) {
+			pr_info("Primary fb resume timeout\n");
+			return -ETIMEDOUT;
+		}
+
+	#ifdef CONFIG_FRAMEBUFFER_CONSOLE
+		console_lock();
+	#endif
+
+		if (!lock_fb_info(prim_fbi)) {
+		#ifdef CONFIG_FRAMEBUFFER_CONSOLE
+			console_unlock();
+		#endif
+		return -ENODEV;
+		}
+
+		if (prim_fbi->blank == FB_BLANK_UNBLANK) {
+			unlock_fb_info(prim_fbi);
+		#ifdef CONFIG_FRAMEBUFFER_CONSOLE
+			console_unlock();
+		#endif
+
+			return 0;
+		}
+
+		wake_lock(&prim_panel_wakelock);
+		ret = fb_blank(prim_fbi, FB_BLANK_UNBLANK);
+
+		if (!ret) {
+			atomic_set(&prim_panel_is_on, true);
+			if (timeout > 0)
+				schedule_delayed_work(&prim_panel_work, msecs_to_jiffies(timeout));
+			else
+				wake_unlock(&prim_panel_wakelock);
+
+		} else
+			wake_unlock(&prim_panel_wakelock);
+
+		unlock_fb_info(prim_fbi);
+	#ifdef CONFIG_FRAMEBUFFER_CONSOLE
+		console_unlock();
+	#endif
+
+		return ret;
+	}
+
+	pr_err("primary panel is not existed\n");
+	return -EINVAL;
+}
+/*add for fingerprint unlock by qujiong 20190625 end*/
 
 static inline void __user *to_user_ptr(uint64_t address)
 {
@@ -1431,6 +1532,12 @@ static int mdss_fb_remove(struct platform_device *pdev)
 	if (!mfd)
 		return -ENODEV;
 
+	if (mfd->panel_info && mfd->panel_info->is_prim_panel) {
+		atomic_set(&prim_panel_is_on, false);
+		cancel_delayed_work_sync(&prim_panel_work);
+		wake_lock_destroy(&prim_panel_wakelock);
+	}
+
 	mdss_fb_remove_sysfs(mfd);
 
 	pm_runtime_disable(mfd->fbi->dev);
@@ -1606,6 +1713,31 @@ static int mdss_fb_resume(struct platform_device *pdev)
 #endif
 
 #ifdef CONFIG_PM_SLEEP
+
+static int mdss_fb_pm_prepare(struct device *dev)
+{
+	struct msm_fb_data_type *mfd = dev_get_drvdata(dev);
+
+	if (!mfd)
+		return -ENODEV;
+	if (mfd->panel_info->is_prim_panel)
+		atomic_inc(&mfd->resume_pending);
+		return 0;
+}
+
+static void mdss_fb_pm_complete(struct device *dev)
+{
+	struct msm_fb_data_type *mfd = dev_get_drvdata(dev);
+
+	if (!mfd)
+		return;
+	if (mfd->panel_info->is_prim_panel) {
+		atomic_set(&mfd->resume_pending, 0);
+		wake_up_all(&mfd->resume_wait_q);
+	}
+	return;
+}
+
 static int mdss_fb_pm_suspend(struct device *dev)
 {
 	struct msm_fb_data_type *mfd = dev_get_drvdata(dev);
@@ -1660,6 +1792,8 @@ static int mdss_fb_pm_resume(struct device *dev)
 #endif
 
 static const struct dev_pm_ops mdss_fb_pm_ops = {
+	.prepare = mdss_fb_pm_prepare,
+	.complete = mdss_fb_pm_complete,
 	SET_SYSTEM_SLEEP_PM_OPS(mdss_fb_pm_suspend, mdss_fb_pm_resume)
 };
 
@@ -2095,6 +2229,14 @@ static int mdss_fb_blank(int blank_mode, struct fb_info *info)
 	int ret;
 	struct mdss_panel_data *pdata;
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
+
+	if ((info == prim_fbi) && (blank_mode == FB_BLANK_UNBLANK) &&
+		atomic_read(&prim_panel_is_on)) {
+		atomic_set(&prim_panel_is_on, false);
+		wake_unlock(&prim_panel_wakelock);
+		cancel_delayed_work_sync(&prim_panel_work);
+		return 0;
+	}
 
 	ret = mdss_fb_pan_idle(mfd);
 	if (ret) {
@@ -2732,6 +2874,7 @@ static int mdss_fb_register(struct msm_fb_data_type *mfd)
 	atomic_set(&mfd->commits_pending, 0);
 	atomic_set(&mfd->ioctl_ref_cnt, 0);
 	atomic_set(&mfd->kickoff_pending, 0);
+	atomic_set(&mfd->resume_pending, 0);
 
 	init_timer(&mfd->no_update.timer);
 	mfd->no_update.timer.function = mdss_fb_no_update_notify_timer_cb;
@@ -2747,6 +2890,7 @@ static int mdss_fb_register(struct msm_fb_data_type *mfd)
 	init_waitqueue_head(&mfd->idle_wait_q);
 	init_waitqueue_head(&mfd->ioctl_q);
 	init_waitqueue_head(&mfd->kickoff_wait_q);
+	init_waitqueue_head(&mfd->resume_wait_q);
 
 	ret = fb_alloc_cmap(&fbi->cmap, 256, 0);
 	if (ret)
@@ -2764,6 +2908,13 @@ static int mdss_fb_register(struct msm_fb_data_type *mfd)
 	mdss_panel_debugfs_init(panel_info, panel_name);
 	pr_info("FrameBuffer[%d] %dx%d registered successfully!\n", mfd->index,
 					fbi->var.xres, fbi->var.yres);
+
+	if (panel_info->is_prim_panel) {
+		prim_fbi = fbi;
+		atomic_set(&prim_panel_is_on, false);
+		INIT_DELAYED_WORK(&prim_panel_work, prim_panel_off_delayed_work);
+		wake_lock_init(&prim_panel_wakelock, WAKE_LOCK_SUSPEND, "prim_panel_wakelock");
+	}
 
 	return 0;
 }
@@ -3507,19 +3658,16 @@ static int mdss_fb_pan_display(struct fb_var_screeninfo *var,
 {
 	struct mdp_display_commit disp_commit;
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
-	struct mdss_data_type *mdata = mfd_to_mdata(mfd);
 
 	/*
-	 * Abort pan_display operations in following cases:
-	 * 1. during mode switch through mode sysfs node, it will trigger a
-	 *    pan_display after switch. This assumes that fb has been adjusted,
-	 *    however when using overlays we may not have the right size at this
-	 *    point, so it needs to go through PREPARE first.
-	 * 2. When the splash handoff is pending.
+	 * during mode switch through mode sysfs node, it will trigger a
+	 * pan_display after switch. This assumes that fb has been adjusted,
+	 * however when using overlays we may not have the right size at this
+	 * point, so it needs to go through PREPARE first. Abort pan_display
+	 * operations until that happens
 	 */
-	if ((mfd->switch_state != MDSS_MDP_NO_UPDATE_REQUESTED) ||
-		(mdss_fb_is_hdmi_primary(mfd) && mdata->handoff_pending)) {
-		pr_debug("fb%d: pan_display skipped during switch or handoff\n",
+	if (mfd->switch_state != MDSS_MDP_NO_UPDATE_REQUESTED) {
+		pr_debug("fb%d: pan_display skipped during switch\n",
 				mfd->index);
 		return 0;
 	}
@@ -3992,7 +4140,7 @@ static int mdss_fb_set_par(struct fb_info *info)
 {
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
 	struct fb_var_screeninfo *var = &info->var;
-	int old_imgType, old_format, out_format;
+	int old_imgType, old_format;
 	int ret = 0;
 
 	ret = mdss_fb_pan_idle(mfd);
@@ -4075,23 +4223,17 @@ static int mdss_fb_set_par(struct fb_info *info)
 		mfd->fbi->fix.smem_len = PAGE_ALIGN(mfd->fbi->fix.line_length *
 				mfd->fbi->var.yres) * mfd->fb_page;
 
-	old_format = mfd->panel_info->out_format;
-	out_format = mdss_grayscale_to_mdp_format(var->grayscale);
-	if (!IS_ERR_VALUE(out_format)) {
-		mfd->panel_info->out_format = out_format;
+	old_format = mdss_grayscale_to_mdp_format(var->grayscale);
+	if (!IS_ERR_VALUE(old_format)) {
 		if (old_format != mfd->panel_info->out_format)
 			mfd->panel_reconfig = true;
 	}
-
-	if (mdss_fb_is_hdmi_primary(mfd) && mfd->panel_reconfig)
-		mfd->force_null_commit = true;
 
 	if (mfd->panel_reconfig || (mfd->fb_imgType != old_imgType)) {
 		mdss_fb_blank_sub(FB_BLANK_POWERDOWN, info, mfd->op_enable);
 		mdss_fb_var_to_panelinfo(var, mfd->panel_info);
 		mdss_fb_blank_sub(FB_BLANK_UNBLANK, info, mfd->op_enable);
 		mfd->panel_reconfig = false;
-		mfd->force_null_commit = false;
 	}
 
 	return ret;
@@ -4671,7 +4813,6 @@ static int mdss_fb_atomic_commit_ioctl(struct fb_info *info,
 	struct mdp_destination_scaler_data __user *ds_data_user;
 	struct msm_fb_data_type *mfd;
 	struct mdss_overlay_private *mdp5_data = NULL;
-	struct mdss_data_type *mdata;
 
 	ret = copy_from_user(&commit, argp, sizeof(struct mdp_layer_commit));
 	if (ret) {
@@ -4774,13 +4915,6 @@ static int mdss_fb_atomic_commit_ioctl(struct fb_info *info,
 	ds_data_user = commit.commit_v1.dest_scaler;
 	if ((ds_data_user) &&
 		(commit.commit_v1.dest_scaler_cnt)) {
-		mdata = mfd_to_mdata(mfd);
-		if (!mdata || !mdata->scaler_off ||
-				 !mdata->scaler_off->has_dest_scaler) {
-			pr_err("dest scaler not supported\n");
-			ret = -EPERM;
-			goto err;
-		}
 		ret = __mdss_fb_copy_destscaler_data(info, &commit);
 		if (ret) {
 			pr_err("copy dest scaler failed\n");

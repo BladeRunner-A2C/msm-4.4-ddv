@@ -2,7 +2,7 @@
  * drivers/staging/android/ion/ion_system_heap.c
  *
  * Copyright (C) 2011 Google, Inc.
- * Copyright (c) 2011-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -270,9 +270,6 @@ static struct page_info *alloc_from_pool_preferred(
 	struct page_info *info;
 	int i;
 
-	if (buffer->flags & ION_FLAG_POOL_FORCE_ALLOC)
-		goto force_alloc;
-
 	info = kmalloc(sizeof(*info), GFP_KERNEL);
 	if (!info)
 		return NULL;
@@ -304,7 +301,6 @@ static struct page_info *alloc_from_pool_preferred(
 	}
 
 	kfree(info);
-force_alloc:
 	return alloc_largest_available(heap, buffer, size, max_order);
 }
 
@@ -348,7 +344,7 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 	struct sg_table table_sync;
 	struct scatterlist *sg;
 	struct scatterlist *sg_sync;
-	int ret = 0;
+	int ret;
 	struct list_head pages;
 	struct list_head pages_from_pool;
 	struct page_info *info, *tmp_info;
@@ -482,7 +478,7 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 
 err_free_sg2:
 	/* We failed to zero buffers. Bypass pool */
-	buffer->private_flags |= ION_PRIV_FLAG_SHRINKER_FREE;
+	buffer->flags |= ION_PRIV_FLAG_SHRINKER_FREE;
 
 	if (vmid > 0)
 		ion_system_secure_heap_unassign_sg(table, vmid);

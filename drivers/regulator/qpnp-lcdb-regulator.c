@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2018, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -25,6 +25,9 @@
 #include <linux/regulator/of_regulator.h>
 #include <linux/regulator/machine.h>
 #include <linux/qpnp/qpnp-revid.h>
+/*modify by shenwenbin for open double tap wakeup 20190516 begin*/
+#include <linux/lct_tp_fm_info.h>
+/*modify by shenwenbin for open double tap wakeup 20190516 end*/
 
 #define QPNP_LCDB_REGULATOR_DRIVER_NAME		"qcom,qpnp-lcdb-regulator"
 
@@ -793,6 +796,14 @@ static irqreturn_t qpnp_lcdb_sc_irq_handler(int irq, void *data)
 	rc = qpnp_lcdb_read(lcdb, lcdb->base + INT_RT_STATUS_REG, &val, 1);
 	if (rc < 0)
 		goto irq_handled;
+
+        /*modify by shenwenbin for open double tap wakeup 20190516 begin*/
+        //printk("swb.%s set wakeup note\n",__func__);
+        if(tp_gesture_wakeup() == 1)        
+             lcdb->ttw_enable = true;
+        else
+             lcdb->ttw_enable = false;
+        /*modify by shenwenbin for open double tap wakeup 20190516 end*/
 
 	if (val & SC_ERROR_RT_STS_BIT) {
 		rc = qpnp_lcdb_read(lcdb,
@@ -1671,8 +1682,8 @@ static int qpnp_lcdb_init_bst(struct qpnp_lcdb *lcdb)
 
 		if (lcdb->bst.ps != -EINVAL) {
 			rc = qpnp_lcdb_masked_write(lcdb, lcdb->base +
-				LCDB_PS_CTL_REG, EN_PS_BIT,
-				lcdb->bst.ps ? EN_PS_BIT : 0);
+					LCDB_PS_CTL_REG, EN_PS_BIT,
+					&lcdb->bst.ps ? EN_PS_BIT : 0);
 			if (rc < 0) {
 				pr_err("Failed to disable BST PS rc=%d", rc);
 				return rc;
